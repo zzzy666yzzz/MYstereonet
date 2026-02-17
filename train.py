@@ -241,13 +241,13 @@ def main():
     parser.add_argument("--datapath", type=str, default="./dataset/", help="Data root")
     parser.add_argument("--savemodel", type=str, default="./checkpoints/", help="Save path")
     parser.add_argument("--maxdisp", type=int, default=256)
-    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--accum_steps", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--resume", type=str, default=None,
+    parser.add_argument("--resume", type=str, default="./checkpoints/best_model.pth",
                         help="Path to checkpoint (e.g., ./checkpoints/checkpoint.pth.tar)")
     args = parser.parse_args()
 
@@ -294,9 +294,10 @@ def main():
     base_params = filter(lambda p: id(p) not in backbone_ids, model.parameters())
 
     # 3. 分组设置学习率
+    # === 微调阶段：学习率降 10 倍 ===
     optimizer = optim.AdamW([
-        {'params': base_params, 'lr': args.lr},  # 匹配头: 1e-3 (大火爆炒)
-        {'params': model.backbone.parameters(), 'lr': args.lr * 0.1}  # Backbone: 1e-4 (小火慢炖)
+        {'params': base_params, 'lr': 1e-4},  # Head: 从 1e-3 改为 1e-4
+        {'params': model.backbone.parameters(), 'lr': 1e-5}  # Backbone: 从 1e-4 改为 1e-5
     ], weight_decay=1e-4)
 
     logging.info(f"已启用差分学习率: Backbone LR={args.lr * 0.1:.6f}, Head LR={args.lr:.6f}")
@@ -312,27 +313,33 @@ def main():
     start_epoch = 1
     best_d1 = 100.0
 
-    # 4. 断点续训逻辑 (核心)
+    # 4. 断点续训逻辑 / 微调逻辑
     if args.resume and os.path.isfile(args.resume):
         logging.info(f"Loading checkpoint '{args.resume}'")
         ckpt = torch.load(args.resume, map_location=device)
 
-        # 加载模型权重
-        model.load_state_dict(ckpt["state_dict"], strict=False)
+        # 1. 必须加载：模型权重
+        # strict=True 保证权重完全匹配，更安全
+        model.load_state_dict(ckpt["state_dict"], strict=True)
 
-        # 加载优化器状态 (关键: 恢复动量)
-        if "optimizer" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer"])
+        # 2. 微调时【不要】加载以下内容：
+        # 我们希望使用新的小学习率 (1e-4/1e-5) 和新的优化器，而不是沿用旧的
+        # if "optimizer" in ckpt:
+        #     optimizer.load_state_dict(ckpt["optimizer"])
+        # if "scheduler" in ckpt:
+        #     scheduler.load_state_dict(ckpt["scheduler"])
+        # if "epoch" in ckpt:
+        #     start_epoch = ckpt["epoch"] + 1
 
-        # 加载 Scheduler 状态 (关键: 恢复学习率)
-        if "scheduler" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler"])
+        # 3. 如果是微调，这里强制重置 start_epoch 为 1
+        start_epoch = 1
 
-        if "epoch" in ckpt:
-            start_epoch = ckpt["epoch"] + 1
-        if "best_d1" in ckpt:
-            best_d1 = ckpt["best_d1"]
-        logging.info(f"已恢复至 epoch {start_epoch}, best_d1={best_d1:.2f}%")
+        # 4. (可选) 加载之前的最佳指标，方便对比，或者直接重置为 100
+        # if "best_d1" in ckpt:
+        #     best_d1 = ckpt["best_d1"]
+        best_d1 = 100.0  # 微调阶段我们想看它能不能再次创新低，重置比较好观察
+
+        logging.info(f"已加载模型权重进行微调。Start Epoch 重置为 {start_epoch}")
 
     # 5. 训练循环
     for epoch in range(start_epoch, args.epochs + 1):
